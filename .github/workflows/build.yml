@@ -1,0 +1,113 @@
+
+name: Build Bonsai 2 CUDA for RTX 3060 Ti
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout optimized llama.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: sudoingX/llama.cpp
+          ref: pr-ptq1-mmv
+          path: source
+          persist-credentials: false
+
+      - name: Install CUDA 12.4
+        uses: ./source/.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "12.4"
+          cuda_arch: "x64"
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S source -B source/build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DGGML_CUDA=ON `
+            -DCMAKE_CUDA_ARCHITECTURES=86 `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_EXAMPLES=ON `
+            -DLLAMA_BUILD_TESTS=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
+
+      - name: Build server and benchmark
+        shell: pwsh
+        run: |
+          cmake --build source/build `
+            --config Release `
+            --parallel 2 `
+            --target llama-server llama-bench
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+          }
+
+      - name: Package executables and DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Path dist -Force |
+            Out-Null
+
+          $server = Get-ChildItem source/build/bin `
+            -Recurse -Filter llama-server.exe |
+            Select-Object -First 1
+
+          if (-not $server) {
+            throw "llama-server.exe not found"
+          }
+
+          $bin = $server.DirectoryName
+
+          if (-not (Test-Path (Join-Path $bin "llama-bench.exe"))) {
+            throw "llama-bench.exe not found"
+          }
+
+          Copy-Item (Join-Path $bin "*") dist `
+            -Recurse -Force
+
+          foreach ($dir in @(
+            "$env:CUDA_PATH\bin",
+            "$env:CUDA_PATH\bin\x64"
+          )) {
+            if (-not (Test-Path $dir)) {
+              continue
+            }
+
+            foreach ($pattern in @(
+              "cudart64_*.dll",
+              "cublas64_*.dll",
+              "cublasLt64_*.dll"
+            )) {
+              Get-ChildItem $dir -Filter $pattern -File |
+                Copy-Item -Destination dist -Force
+            }
+          }
+
+          Get-ChildItem dist
+
+          if (-not (Test-Path dist/llama-server.exe)) {
+            throw "Packaging failed"
+          }
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai2-cuda-sm86-windows
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
